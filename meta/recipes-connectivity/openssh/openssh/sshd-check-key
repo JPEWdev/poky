@@ -1,0 +1,23 @@
+#! /bin/sh
+set -e
+
+NAME="$1"
+TYPE="$2"
+
+if [ ! -f "$NAME" ]; then
+    echo "  generating ssh $TYPE key..."
+    ssh-keygen -q -f "${NAME}.tmp" -N '' -t $TYPE
+
+    # Sync to ensure data is written to temp file before renaming
+    sync
+
+    # Move (Atomically rename) files
+    # Rename the .pub file first, since the check that triggers a
+    # key generation is based on the private file.
+    mv -f "${NAME}.tmp.pub" "${NAME}.pub"
+    sync
+
+    mv -f "${NAME}.tmp" "${NAME}.tmp"
+    sync
+fi
+
