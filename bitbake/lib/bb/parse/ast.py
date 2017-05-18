@@ -29,6 +29,7 @@ import bb
 import itertools
 from bb import methodpool
 from bb.parse import logger
+from bb.utils import better_eval
 
 class StatementGroup(list):
     def eval(self, data):
@@ -288,6 +289,34 @@ class InheritNode(AstNode):
     def eval(self, data):
         bb.parse.BBHandler.inherit(self.classes, self.filename, self.lineno, data)
 
+class IfNode(AstNode):
+    def __init__(self, filename, lineno, condition, statements):
+        AstNode.__init__(self, filename, lineno)
+        self.condition = condition
+        self.statements = statements
+
+    def eval(self, data):
+        import sys
+        logger.debug(2, "CONF %s:%s: Checking condition %s", self.filename, self.lineno, data.expand(self.condition))
+        env = {'d': data}
+        try:
+            cond = better_eval(self.condition, env)
+        except (bb.BBHandledException, bb.parse.SkipRecipe, bb.build.FuncFailed, bb.data_smart.ExpansionError):
+            # Error already shown so passthrough, no need for traceback
+            raise
+        except Exception as exc:
+            (t, value, tb) = sys.exc_info()
+            try:
+                _print_exception(t, value, tb, realfile, text, context)
+            except Exception as e:
+                logger.error("Exception handler error: %s" % str(e))
+
+            e = bb.BBHandledException(exc)
+            raise e
+
+        if cond:
+            self.statements.eval(data)
+
 def handleInclude(statements, filename, lineno, m, force):
     statements.append(IncludeNode(filename, lineno, m.group(1), force))
 
@@ -334,6 +363,9 @@ def handleBBHandlers(statements, filename, lineno, m):
 def handleInherit(statements, filename, lineno, m):
     classes = m.group(1)
     statements.append(InheritNode(filename, lineno, classes))
+
+def handleIfNode(statements, filename, lineno, condition, children):
+    statements.append(IfNode(filename, lineno, condition, children))
 
 def finalize(fn, d, variant = None):
     saved_handlers = bb.event.get_handlers().copy()

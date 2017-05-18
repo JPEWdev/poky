@@ -46,6 +46,7 @@ __deltask_regexp__       = re.compile("deltask\s+(?P<func>\w+)")
 __addhandler_regexp__    = re.compile( r"addhandler\s+(.+)" )
 __def_regexp__           = re.compile( r"def\s+(\w+).*:" )
 __python_func_regexp__   = re.compile( r"(\s+.*)|(^$)" )
+__if_begin_regexp__      = re.compile( r"if\s+(?P<condition>.+):")
 
 __infunc__ = []
 __inpython__ = False
@@ -81,30 +82,55 @@ def inherit(files, fn, lineno, d):
             include(fn, file, lineno, d, "inherit")
             __inherit_cache = d.getVar('__inherit_cache', False) or []
 
+def close_block(statement_stack, fn=None, lineno=None):
+    b = statement_stack.pop()
+
+    if not statement_stack:
+        raise ParseError("Unexpected indent", fn, lineno)
+
+    statements = statement_stack[-1]['statements']
+    ast.handleIfNode(statements, b['filename'], b['lineno'], b['condition'],
+            b['statements'])
+
+    return statements
+
+
 def get_statements(filename, absolute_filename, base_name):
     global cached_statements
 
     try:
         return cached_statements[absolute_filename]
-    except KeyError:
-        with open(absolute_filename, 'r') as f:
-            statements = ast.StatementGroup()
+    except KeyError as e:
+        pass
 
-            lineno = 0
-            while True:
-                lineno = lineno + 1
-                s = f.readline()
-                if not s: break
-                s = s.rstrip()
-                feeder(lineno, s, filename, base_name, statements)
+    statement_stack = [{
+        'statements': ast.StatementGroup(),
+        'filename': filename,
+        'lineno': 1,
+        'condition': '1',
+        'indent': '',
+        }]
 
-        if __inpython__:
-            # add a blank line to close out any python definition
-            feeder(lineno, "", filename, base_name, statements, eof=True)
+    with open(absolute_filename, 'r') as f:
+        lineno = 0
+        while True:
+            lineno = lineno + 1
+            s = f.readline()
+            if not s: break
+            s = s.rstrip()
+            feeder(lineno, s, filename, base_name, statement_stack)
 
-        if filename.endswith(".bbclass") or filename.endswith(".inc"):
-            cached_statements[absolute_filename] = statements
-        return statements
+    if __inpython__:
+        # add a blank line to close out any python definition
+        feeder(lineno, "", filename, base_name, statement_stack, eof=True)
+
+    # Close out all remaining blocks
+    while len(statement_stack) > 1:
+        close_block(statement_stack)
+
+    if filename.endswith(".bbclass") or filename.endswith(".inc"):
+        cached_statements[absolute_filename] = statement_stack[0]['statements']
+    return statement_stack[0]['statements']
 
 def handle(fn, d, include):
     global __func_start_regexp__, __inherit_regexp__, __export_func_regexp__, __addtask_regexp__, __addhandler_regexp__, __infunc__, __body__, __residue__, __classname__
@@ -161,9 +187,23 @@ def handle(fn, d, include):
 
     return d
 
-def feeder(lineno, s, fn, root, statements, eof=False):
+
+def feeder(lineno, s, fn, root, statement_stack, eof=False):
+    def check_indent(line):
+        # The line must either be completely empty (after rstrip()) or be
+        # prefixed with the current indent, which will be removed
+        if not line:
+            return line
+        indent = statement_stack[-1]['indent']
+        if not line.startswith(indent):
+            raise ParseError("Unexpected indent", fn, lineno)
+        return line[len(indent):]
+
     global __func_start_regexp__, __inherit_regexp__, __export_func_regexp__, __addtask_regexp__, __addhandler_regexp__, __def_regexp__, __python_func_regexp__, __inpython__, __infunc__, __body__, bb, __residue__, __classname__
+    statements = statement_stack[-1]['statements']
+
     if __infunc__:
+        s = check_indent(s)
         if s == '}':
             __body__.append('')
             ast.handleMethod(statements, fn, lineno, __infunc__[0], __body__, __infunc__[3], __infunc__[4])
@@ -174,6 +214,7 @@ def feeder(lineno, s, fn, root, statements, eof=False):
         return
 
     if __inpython__:
+        s = check_indent(s)
         m = __python_func_regexp__.match(s)
         if m and not eof:
             __body__.append(s)
@@ -205,9 +246,26 @@ def feeder(lineno, s, fn, root, statements, eof=False):
     if s == '':
         return
 
+    # Strip off indent
+    indent = re.match(r'^(\s*)(?=\S)', s).group(0)
+    s = s[len(indent):]
+
     # Skip comments
     if s[0] == '#':
         return
+
+    if statement_stack[-1]['indent'] is None:
+        # This is the first statement of this block, it must be more indented
+        # than the previous block
+        if not indent.startswith(statement_stack[-2]['indent']) or len(indent) <= len(statement_stack[-2]['indent']):
+            raise ParseError("Unexpected indent", fn, lineno)
+        statement_stack[-1]['indent'] = indent
+    else:
+        # If this statement is not indented correctly for the current block,
+        # close it. Repeat this process until we find a matching block. If we
+        # run out of blocks, close_block() will raise an exception
+        while indent != statement_stack[-1]['indent']:
+            statements = close_block(statement_stack, fn, lineno)
 
     m = __func_start_regexp__.match(s)
     if m:
@@ -244,6 +302,17 @@ def feeder(lineno, s, fn, root, statements, eof=False):
     m = __inherit_regexp__.match(s)
     if m:
         ast.handleInherit(statements, fn, lineno, m)
+        return
+
+    m = __if_begin_regexp__.match(s)
+    if m:
+        statement_stack.append({
+            'statements': ast.StatementGroup(),
+            'filename': fn,
+            'lineno': lineno,
+            'condition': m.group('condition'),
+            'indent': None,
+            })
         return
 
     return ConfHandler.feeder(lineno, s, fn, statements)
